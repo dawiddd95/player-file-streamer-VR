@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"
+        tools:targetApi="33" />
+
+    <!-- VR headset compatibility — nie wymagaj hardware'u którego gogle nie mają -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!--
+        VR: supports-screens z anyDensity=false wymusza tryb kompatybilności,
+        co na goglach Quest często skutkuje WIĘKSZYM panelem 2D.
+        requiresSmallestWidthDp=960 mówi systemowi, że apka potrzebuje dużego ekranu.
+    -->
+    <supports-screens
+        android:anyDensity="false"
+        android:xlargeScreens="true"
+        android:largeScreens="true"
+        android:normalScreens="true"
+        android:smallScreens="false"
+        android:requiresSmallestWidthDp="960" />
+
+    <application
+        android:name=".VrApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FileStreaming"
+        android:usesCleartextTraffic="true"
+        android:resizeableActivity="true"
+        android:largeHeap="true">
+
+        <!--
+            Meta Quest: meta-data informujące system o preferencjach aplikacji.
+            supportedDevices — gogle na których apka powinna być widoczna.
+            handtracking.version — apka obsługuje hand tracking (wygodniejsze).
+        -->
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest|quest2|questpro|quest3" />
+        <meta-data android:name="com.oculus.handtracking.version" android:value="V2.0" />
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:theme="@style/Theme.FileStreaming">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- VR: żądaj dużego okna dla ekranu startowego -->
+            <layout
+                android:defaultWidth="1920dp"
+                android:defaultHeight="1080dp"
+                android:gravity="center"
+                android:minWidth="1280dp"
+                android:minHeight="720dp" />
+        </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:theme="@style/Theme.FileStreaming">
+
+            <!-- VR: żądaj dużego okna dla przeglądarki plików -->
+            <layout
+                android:defaultWidth="1920dp"
+                android:defaultHeight="1080dp"
+                android:gravity="center"
+                android:minWidth="1280dp"
+                android:minHeight="720dp" />
+        </activity>
+
+        <activity
+            android:name=".StreamPlayerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.FileStreaming.Cinema"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+
+            <!--
+                VR: żądaj MAKSYMALNIE dużego okna/panelu na goglach.
+                2560x1440dp to rozdzielczość typowa dla Quest 3.
+                System da tyle ile może — ale nie mniej niż minWidth/minHeight.
+            -->
+            <layout
+                android:defaultWidth="2560dp"
+                android:defaultHeight="1440dp"
+                android:gravity="center"
+                android:minWidth="1920dp"
+                android:minHeight="1080dp" />
+        </activity>
+
+    </application>
+
+</manifest>
+
