@@ -58,10 +58,16 @@ class StreamPlayerActivity : AppCompatActivity() {
         private const val PLAY_DELAY_SECONDS = 5
 
         // ---- Zarządzanie pamięcią (buffer) ----
-        private const val MIN_BUFFER_MS = 15_000        // 15s — minimum do buforowania
-        private const val MAX_BUFFER_MS = 60_000        // 60s — max bufor w przód (~30–180 MB)
-        private const val BUFFER_PLAYBACK_MS = 2_500     // 2.5s — wystarczy żeby zacząć odtwarzanie
-        private const val BUFFER_REBUFFER_MS = 5_000     // 5s — po rebufferze
+        // Wartości dostrojone pod Wi-Fi (sieć radiowa = jitter, nie kabel).
+        // Poprzednie MIN_BUFFER_MS=15s / BUFFER_PLAYBACK_MS=2.5s startowały
+        // odtwarzanie z bardzo małym zapasem — wystarczał chwilowy spadek
+        // przepustowości (retransmisja Wi-Fi, GC, obciążenie serwera), żeby
+        // bufor się wyczerpał szybciej niż zdążył dociągnąć dane, co dawało
+        // losowe ścinanie w trakcie odtwarzania mimo szybkiego łącza.
+        private const val MIN_BUFFER_MS = 30_000        // 30s — minimum do buforowania
+        private const val MAX_BUFFER_MS = 90_000        // 90s — max bufor w przód
+        private const val BUFFER_PLAYBACK_MS = 5_000     // 5s zapasu przed startem odtwarzania
+        private const val BUFFER_REBUFFER_MS = 8_000     // 8s zapasu po rebufferze, zanim ruszy dalej
         private const val BACK_BUFFER_MS = 10_000        // 10s — tył bufora, potem zwolnij RAM
 
         // ---- Sliding window (playlista) ----
@@ -286,6 +292,15 @@ class StreamPlayerActivity : AppCompatActivity() {
                 BUFFER_REBUFFER_MS
             )
             .setBackBuffer(BACK_BUFFER_MS, false)  // Zwolnij dane po 10s za kursorem
+            // KRYTYCZNE dla wideo VR (duża rozdzielczość = duży bitrate):
+            // Domyślny DefaultLoadControl ma też limit bufora WG ROZMIARU (bajtów),
+            // nie tylko wg czasu. Przy wysokim bitrate plik VR mógł trafiać w ten
+            // limit rozmiaru i przestawać buforować na długo PRZED osiągnięciem
+            // MAX_BUFFER_MS w czasie — co dawało wyczerpanie bufora i zacięcie,
+            // mimo że łącze (140 Mb/s) miało zapas przepustowości.
+            // prioritizeTimeOverSizeThresholds=true każe LoadControl trzymać się
+            // wyłącznie progów czasowych zdefiniowanych wyżej.
+            .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
         player = ExoPlayer.Builder(this)
@@ -743,5 +758,3 @@ class StreamPlayerActivity : AppCompatActivity() {
         }
     }
 }
-
-
