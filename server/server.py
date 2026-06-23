@@ -1,760 +1,578 @@
-package com.filestreaming.app
-
-import android.content.res.Configuration
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.GestureDetector
-import android.view.MotionEvent
-import android.view.View
-import android.view.WindowManager
-import android.widget.TextView
-import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.OptIn
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import com.google.android.material.button.MaterialButton
-
-/**
- * Odtwarzacz streamingowy VR — streamuje pliki wideo z serwera HTTP.
- *
- * Wersja VR: okno/panel na goglach jest maksymalnie duże (cała szerokość
- * i wysokość pola widzenia). Wideo skaluje się z zachowaniem proporcji
- * (resize_mode="fit") — jak na ekranie kinowym w VR.
- *
- * Cechy:
- * - Streamuje bez pobierania na dysk (tylko bufor w RAM)
- * - Obsługuje przewijanie (Range requests)
- * - Obsługuje playlisty (wiele plików) z zarządzaniem pamięcią
- * - Pełny immersive mode (bez pasków systemowych)
- * - Zapętlanie / losowa kolejność
- * - Przejdź do następnego / poprzedniego pliku
- * - Muzyka w tle (drugi ExoPlayer) — wybór pliku audio z urządzenia
- * - Start z 5-sekundowym opóźnieniem po kliknięciu Play
- *
- * Zarządzanie pamięcią:
- * - DefaultLoadControl ogranicza bufor do ~60s w przód, ~10s w tył
- * - Sliding window: max ~55 elementów załadowanych w playerze jednocześnie
- *   (50 w przód + 5 w tył od aktualnej pozycji)
- * - Reszta playlisty trzymana jest jako lekkie tablice URL/nazw
- */
-class StreamPlayerActivity : AppCompatActivity() {
-
-    companion object {
-        private const val HIDE_CONTROLS_DELAY = 3000L
-        private const val PLAY_DELAY_SECONDS = 5
-
-        // ---- Zarządzanie pamięcią (buffer) ----
-        // Wartości dostrojone pod Wi-Fi (sieć radiowa = jitter, nie kabel).
-        // Poprzednie MIN_BUFFER_MS=15s / BUFFER_PLAYBACK_MS=2.5s startowały
-        // odtwarzanie z bardzo małym zapasem — wystarczał chwilowy spadek
-        // przepustowości (retransmisja Wi-Fi, GC, obciążenie serwera), żeby
-        // bufor się wyczerpał szybciej niż zdążył dociągnąć dane, co dawało
-        // losowe ścinanie w trakcie odtwarzania mimo szybkiego łącza.
-        private const val MIN_BUFFER_MS = 30_000        // 30s — minimum do buforowania
-        private const val MAX_BUFFER_MS = 90_000        // 90s — max bufor w przód
-        private const val BUFFER_PLAYBACK_MS = 5_000     // 5s zapasu przed startem odtwarzania
-        private const val BUFFER_REBUFFER_MS = 8_000     // 8s zapasu po rebufferze, zanim ruszy dalej
-        private const val BACK_BUFFER_MS = 10_000        // 10s — tył bufora, potem zwolnij RAM
-
-        // ---- Sliding window (playlista) ----
-        private const val WINDOW_AHEAD = 50              // Ładuj max 50 elementów w przód
-        private const val WINDOW_BEHIND = 5              // Trzymaj 5 elementów w tył
-    }
-
-    // --- Player ---
-    private lateinit var player: ExoPlayer
-    private var audioPlayer: ExoPlayer? = null
-
-    // --- UI ---
-    private lateinit var playerView: PlayerView
-    private lateinit var controlsPanel: View
-    private lateinit var titleLabel: TextView
-    private lateinit var fileCounterLabel: TextView
-    private lateinit var statusLabel: TextView
-    private lateinit var audioLabel: TextView
-    private lateinit var btnPlayPause: MaterialButton
-    private lateinit var btnPrev: MaterialButton
-    private lateinit var btnNext: MaterialButton
-    private lateinit var btnFullscreen: MaterialButton
-    private lateinit var btnLoop: MaterialButton
-    private lateinit var btnRandom: MaterialButton
-    private lateinit var btnSelectAudio: MaterialButton
-
-    // --- State ---
-    private var playlistUrls: Array<String> = emptyArray()
-    private var playlistNames: Array<String> = emptyArray()
-    private var windowStart = 0   // Absolute index pierwszego elementu załadowanego w playerze
-    private var isLooping = false
-    private var isRandomMode = false
-    private var isMuted = false
-    private var isFullscreen = false
-    private var controlsVisible = true
-    private var backgroundAudioUri: Uri? = null
-
-    private val hideHandler = Handler(Looper.getMainLooper())
-    private val hideRunnable = Runnable { hideControls() }
-
-    private val playHandler = Handler(Looper.getMainLooper())
-    private var countdownSeconds = 0
-
-    // --- Activity Result Launcher for audio file picker ---
-    private val pickAudio =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            uri?.let { onAudioPicked(it) }
-        }
-
-    // =========================================================================
-    // Lifecycle
-    // =========================================================================
-
-    @OptIn(UnstableApi::class)
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        // VR: nadpisz density w kontekście Activity (uzupełnia VrApp)
-        overrideActivityDensity()
-
-        // VR: tryb kina — immersive, ekran zawsze włączony, maksymalny panel
-        setupCinemaMode()
-
-        setContentView(R.layout.activity_player)
-
-        initViews()
-        initPlayer()
-        initGestureDetector()
-
-        // Załaduj playlistę z PlaylistHolder (BEZ auto-play)
-        loadFromPlaylistHolder()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        // VR: przywróć immersive mode (gogle mogą go zresetować)
-        enterFullscreen()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        player.pause()
-        audioPlayer?.pause()
-        playHandler.removeCallbacksAndMessages(null)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        hideHandler.removeCallbacks(hideRunnable)
-        playHandler.removeCallbacksAndMessages(null)
-        player.release()
-        audioPlayer?.release()
-        PlaylistHolder.clear()
-    }
-
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // VR: po zmianie konfiguracji (np. obrót) — ponownie nadpisz density
-        overrideActivityDensity()
-    }
-
-    // =========================================================================
-    // VR Cinema Mode
-    // =========================================================================
-
-    /**
-     * Nadpisuje density w kontekście Activity.
-     * Uzupełnia globalny override z VrApp — Activity ma własny Resources
-     * który trzeba osobno skonfigurować.
-     */
-    private fun overrideActivityDensity() {
-        val targetDpi = VrApp.VR_DENSITY_DPI
-        val density = targetDpi / 160f
-
-        resources.displayMetrics.apply {
-            densityDpi = targetDpi
-            this.density = density
-            scaledDensity = density
-        }
-        resources.configuration.densityDpi = targetDpi
-    }
-
-    /**
-     * Konfiguruje pełny tryb kina VR:
-     * - Ekran zawsze włączony (nie gaśnie w goglach)
-     * - Ukryj WSZYSTKO (status bar, navigation bar)
-     * - Rysuj pod wycięciami ekranu (notch/cutout)
-     * - Żądaj maksymalnego rozmiaru okna
-     */
-    @Suppress("DEPRECATION")
-    private fun setupCinemaMode() {
-        // Ekran zawsze włączony — nie gaśnie w VR
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Pełny immersive mode — schowaj WSZYSTKO (status bar, navigation bar)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-
-        // Display cutout — rysuj pod wycięciami ekranu (notch)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            window.attributes.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        }
-
-        // VR: programowe żądanie maksymalnego rozmiaru okna/panelu
-        requestMaxWindowSize()
-    }
-
-    /**
-     * Programowo żąda maksymalnego rozmiaru okna.
-     * Na goglach Meta Quest to ustawia panel 2D na największy możliwy rozmiar.
-     */
-    @Suppress("DEPRECATION")
-    private fun requestMaxWindowSize() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ (API 30)
-            window.setDecorFitsSystemWindows(false)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                window.attributes.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            }
-
-            // Rozciągnij okno na CAŁY dostępny ekran, nawet poza system bars
-            window.setAttributes(window.attributes.apply {
-                width = WindowManager.LayoutParams.MATCH_PARENT
-                height = WindowManager.LayoutParams.MATCH_PARENT
-                flags = flags or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            })
-        } else {
-            // Starsze API — użyj system UI flags
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    )
-        }
-    }
-
-    // =========================================================================
-    // Init
-    // =========================================================================
-
-    @OptIn(UnstableApi::class)
-    private fun initViews() {
-        playerView = findViewById(R.id.playerView)
-        controlsPanel = findViewById(R.id.controlsPanel)
-        titleLabel = findViewById(R.id.titleLabel)
-        fileCounterLabel = findViewById(R.id.fileCounterLabel)
-        statusLabel = findViewById(R.id.statusLabel)
-        audioLabel = findViewById(R.id.audioLabel)
-        btnPlayPause = findViewById(R.id.btnPlayPause)
-        btnPrev = findViewById(R.id.btnPrev)
-        btnNext = findViewById(R.id.btnNext)
-        btnFullscreen = findViewById(R.id.btnFullscreen)
-        btnLoop = findViewById(R.id.btnLoop)
-        btnRandom = findViewById(R.id.btnRandom)
-        btnSelectAudio = findViewById(R.id.btnSelectAudio)
-
-        // VR Cinema: wideo dopasowuje się do rozmiaru okna, zachowując proporcje
-        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-
-        btnPlayPause.setOnClickListener { togglePlayPause() }
-        btnPrev.setOnClickListener { playPrevious() }
-        btnNext.setOnClickListener { playNext() }
-        btnFullscreen.setOnClickListener { toggleFullscreen() }
-        btnLoop.setOnClickListener { toggleLoop() }
-        btnRandom.setOnClickListener { toggleRandom() }
-        btnSelectAudio.setOnClickListener { pickAudio.launch(arrayOf("audio/*")) }
-    }
-
-    @OptIn(UnstableApi::class)
-    private fun initPlayer() {
-        // ── Ograniczenie buforowania — oszczędność RAM ──
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                MIN_BUFFER_MS,
-                MAX_BUFFER_MS,
-                BUFFER_PLAYBACK_MS,
-                BUFFER_REBUFFER_MS
-            )
-            .setBackBuffer(BACK_BUFFER_MS, false)  // Zwolnij dane po 10s za kursorem
-            // KRYTYCZNE dla wideo VR (duża rozdzielczość = duży bitrate):
-            // Domyślny DefaultLoadControl ma też limit bufora WG ROZMIARU (bajtów),
-            // nie tylko wg czasu. Przy wysokim bitrate plik VR mógł trafiać w ten
-            // limit rozmiaru i przestawać buforować na długo PRZED osiągnięciem
-            // MAX_BUFFER_MS w czasie — co dawało wyczerpanie bufora i zacięcie,
-            // mimo że łącze (140 Mb/s) miało zapas przepustowości.
-            // prioritizeTimeOverSizeThresholds=true każe LoadControl trzymać się
-            // wyłącznie progów czasowych zdefiniowanych wyżej.
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-
-        player = ExoPlayer.Builder(this)
-            .setLoadControl(loadControl)
-            .build()
-
-        playerView.player = player
-
-        player.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                when (playbackState) {
-                    Player.STATE_ENDED -> {
-                        statusLabel.text = getString(R.string.stream_ended)
-                        btnPlayPause.text = getString(R.string.play)
-                        showControls()
-                    }
-                    Player.STATE_READY -> {
-                        if (player.isPlaying) {
-                            statusLabel.text = if (isMuted) getString(R.string.streaming_muted)
-                                                else getString(R.string.streaming)
-                        }
-                    }
-                    Player.STATE_BUFFERING -> {
-                        statusLabel.text = getString(R.string.buffering)
-                    }
-                    Player.STATE_IDLE -> {
-                        statusLabel.text = getString(R.string.ready)
-                    }
-                }
-            }
-
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) {
-                    btnPlayPause.text = getString(R.string.pause)
-                    statusLabel.text = if (isMuted) getString(R.string.streaming_muted)
-                                        else getString(R.string.streaming)
-                    scheduleHideControls()
-                } else {
-                    if (player.playbackState != Player.STATE_ENDED) {
-                        btnPlayPause.text = getString(R.string.resume)
-                        statusLabel.text = getString(R.string.paused)
-                    }
-                }
-            }
-
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                // ── Zarządzanie sliding window ──
-                managePlaylistWindow()
-                updateFileCounter()
-                updateTitle()
-            }
-
-            override fun onPlayerError(error: PlaybackException) {
-                statusLabel.text = getString(R.string.stream_error_format, error.message ?: "?")
-                showControls()
-                Toast.makeText(
-                    this@StreamPlayerActivity,
-                    getString(R.string.playback_error),
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        })
-    }
-
-    private fun initGestureDetector() {
-        val gestureDetector = GestureDetector(this,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    if (controlsVisible) hideControls() else showControlsTemporarily()
-                    return true
-                }
-
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    toggleFullscreen()
-                    return true
-                }
-            })
-
-        playerView.setOnTouchListener { _, event ->
-            gestureDetector.onTouchEvent(event)
-            true
-        }
-    }
-
-    // =========================================================================
-    // Load media (BEZ auto-play) + sliding window
-    // =========================================================================
-
-    private fun loadFromPlaylistHolder() {
-        if (!PlaylistHolder.hasData()) {
-            Toast.makeText(this, getString(R.string.no_url), Toast.LENGTH_LONG).show()
-            finish()
-            return
-        }
-
-        // Odczytaj dane z singletona
-        playlistUrls = PlaylistHolder.urls
-        playlistNames = PlaylistHolder.names
-        isMuted = PlaylistHolder.isMuted
-        val startIndex = PlaylistHolder.startIndex
-
-        // Wycisz wideo jeśli tryb bez dźwięku
-        if (isMuted) {
-            player.volume = 0f
-        }
-
-        // Załaduj okno playlisty wokół startIndex (BEZ auto-play)
-        loadPlaylistWindow(startIndex, 0)
-
-        player.repeatMode = Player.REPEAT_MODE_OFF
-        // NIE wywołujemy player.play() — czekamy na kliknięcie Play
-
-        updateFileCounter()
-        updateTitle()
-        statusLabel.text = getString(R.string.ready)
-        btnPlayPause.text = getString(R.string.play)
-
-        // Pełny ekran od razu, ale kontrolki widoczne
-        enterFullscreen()
-        showControls()
-        hideHandler.removeCallbacks(hideRunnable)
-    }
-
-    // =========================================================================
-    // Sliding window — zarządzanie pamięcią playlisty
-    // =========================================================================
-
-    /**
-     * Ładuje okno elementów do playera wokół [centerIndex].
-     * Ładuje max WINDOW_BEHIND elementów za i WINDOW_AHEAD przed aktualną pozycją.
-     */
-    private fun loadPlaylistWindow(centerIndex: Int, seekPosition: Long) {
-        val total = playlistUrls.size
-        windowStart = (centerIndex - WINDOW_BEHIND).coerceAtLeast(0)
-        val windowEnd = (centerIndex + WINDOW_AHEAD).coerceAtMost(total)
-
-        val mediaItems = (windowStart until windowEnd).map {
-            MediaItem.fromUri(playlistUrls[it])
-        }
-
-        val playerIndex = centerIndex - windowStart
-        player.setMediaItems(mediaItems, playerIndex, seekPosition)
-        player.prepare()
-    }
-
-    /**
-     * Dynamicznie dodaje/usuwa elementy w playerze żeby utrzymać okno
-     * wokół aktualnie odtwarzanego pliku. Wywoływane przy przejściu na nowy plik.
-     */
-    private fun managePlaylistWindow() {
-        val total = playlistUrls.size
-        // Przy małych playlistach nie ma co zarządzać
-        if (total <= WINDOW_AHEAD + WINDOW_BEHIND) return
-
-        val playerIdx = player.currentMediaItemIndex
-        val absIdx = windowStart + playerIdx
-
-        // 1. Doładuj elementy w przód jeśli potrzeba
-        val loadedEnd = windowStart + player.mediaItemCount
-        val desiredEnd = (absIdx + WINDOW_AHEAD).coerceAtMost(total)
-        for (i in loadedEnd until desiredEnd) {
-            player.addMediaItem(MediaItem.fromUri(playlistUrls[i]))
-        }
-
-        // 2. Usuń nadmiarowe elementy z tyłu (oszczędność pamięci)
-        //    Przy włączonym zapętlaniu NIE usuwamy — bo player musi wrócić na początek
-        if (!isLooping) {
-            val excess = playerIdx - WINDOW_BEHIND
-            if (excess > 0) {
-                player.removeMediaItems(0, excess)
-                windowStart += excess
-            }
-        }
-    }
-
-    /**
-     * Zwraca bezwzględny indeks aktualnego pliku w pełnej playliście.
-     */
-    private fun getAbsoluteIndex(): Int {
-        return windowStart + player.currentMediaItemIndex
-    }
-
-    // =========================================================================
-    // Background Audio — wybór muzyki z urządzenia
-    // =========================================================================
-
-    private fun onAudioPicked(uri: Uri) {
-        // Zachowaj uprawnienia do odczytu
-        try {
-            contentResolver.takePersistableUriPermission(
-                uri,
-                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-        } catch (_: SecurityException) {}
-
-        backgroundAudioUri = uri
-
-        // Stwórz / odśwież odtwarzacz audio w tle
-        audioPlayer?.release()
-        val ap = ExoPlayer.Builder(this).build()
-        ap.volume = 0.5f  // 50% głośności
-        ap.repeatMode = Player.REPEAT_MODE_ONE  // Zapętlaj muzykę
-
-        val mediaItem = MediaItem.fromUri(uri)
-        ap.setMediaItem(mediaItem)
-        ap.prepare()
-
-        audioPlayer = ap
-
-        // Pobierz nazwę pliku
-        val filename = getFilenameFromUri(uri)
-        audioLabel.text = getString(R.string.audio_format, filename)
-        statusLabel.text = "Muzyka w tle: $filename"
-
-        // Jeśli wideo jest odtwarzane, uruchom audio natychmiast
-        if (player.isPlaying) {
-            ap.play()
-        }
-    }
-
-    private fun getFilenameFromUri(uri: Uri): String {
-        try {
-            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(
-                        android.provider.OpenableColumns.DISPLAY_NAME
-                    )
-                    if (nameIndex >= 0) {
-                        return cursor.getString(nameIndex)
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return uri.lastPathSegment ?: "audio"
-    }
-
-    // =========================================================================
-    // Playback controls (z 5-sekundowym opóźnieniem)
-    // =========================================================================
-
-    private fun togglePlayPause() {
-        if (player.isPlaying) {
-            // Pauza
-            player.pause()
-            audioPlayer?.pause()
-            playHandler.removeCallbacksAndMessages(null)
-            btnPlayPause.text = getString(R.string.resume)
-            statusLabel.text = getString(R.string.paused)
-            showControls()
-            hideHandler.removeCallbacks(hideRunnable)
-        } else {
-            // Jeśli zakończono — przewiń na początek
-            if (player.playbackState == Player.STATE_ENDED) {
-                player.seekTo(0, 0)
-            }
-
-            // Ukryj kontrolki od razu
-            controlsPanel.visibility = View.GONE
-            controlsVisible = false
-
-            // Odliczanie 5 sekund
-            countdownSeconds = PLAY_DELAY_SECONDS
-            playHandler.removeCallbacksAndMessages(null)
-            startCountdown()
-        }
-    }
-
-    private fun startCountdown() {
-        if (countdownSeconds > 0) {
-            statusLabel.text = getString(R.string.start_countdown, countdownSeconds)
-            countdownSeconds--
-            playHandler.postDelayed({ startCountdown() }, 1000)
-        } else {
-            // Czas minął — uruchom odtwarzanie
-            player.play()
-            audioPlayer?.let {
-                if (backgroundAudioUri != null) it.play()
-            }
-            btnPlayPause.text = getString(R.string.pause)
-            statusLabel.text = if (isMuted) getString(R.string.streaming_muted)
-                                else getString(R.string.streaming)
-        }
-    }
-
-    private fun playNext() {
-        val absIdx = getAbsoluteIndex()
-
-        if (player.hasNextMediaItem()) {
-            player.seekToNextMediaItem()
-        } else if (absIdx < playlistUrls.size - 1) {
-            // Jesteśmy na krawędzi okna — doładuj i spróbuj ponownie
-            managePlaylistWindow()
-            if (player.hasNextMediaItem()) {
-                player.seekToNextMediaItem()
-            }
-        } else if (isLooping && playlistUrls.size > 1) {
-            // Koniec playlisty z zapętleniem — wróć na początek
-            val wasPlaying = player.isPlaying
-            loadPlaylistWindow(0, 0)
-            if (wasPlaying) player.play()
-        } else {
-            Toast.makeText(this, getString(R.string.last_file), Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun playPrevious() {
-        if (player.hasPreviousMediaItem()) {
-            player.seekToPreviousMediaItem()
-        } else {
-            val absIdx = getAbsoluteIndex()
-            if (absIdx > 0) {
-                // Okno nie sięga dalej w tył — przeładuj z nowym centrum
-                val wasPlaying = player.isPlaying
-                loadPlaylistWindow(absIdx - 1, 0)
-                if (wasPlaying) player.play()
-            } else {
-                // Już na samym początku
-                player.seekTo(0)
-            }
-        }
-    }
-
-    // =========================================================================
-    // Loop & Random
-    // =========================================================================
-
-    private fun toggleLoop() {
-        isLooping = !isLooping
-        player.repeatMode = if (isLooping) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-        btnLoop.text = getString(if (isLooping) R.string.loop_on else R.string.loop_off)
-
-        // Gdy włączamy pętlę, a okno nie zaczyna się od 0 — musimy dodać
-        // brakujące elementy na początku, bo player musi móc wrócić na start
-        if (isLooping && windowStart > 0) {
-            val missingItems = (0 until windowStart).map {
-                MediaItem.fromUri(playlistUrls[it])
-            }
-            player.addMediaItems(0, missingItems)
-            windowStart = 0
-        }
-    }
-
-    private fun toggleRandom() {
-        isRandomMode = !isRandomMode
-        player.shuffleModeEnabled = isRandomMode
-        btnRandom.text = getString(if (isRandomMode) R.string.random_on else R.string.random_off)
-    }
-
-    // =========================================================================
-    // Fullscreen — VR enhanced
-    // =========================================================================
-
-    /**
-     * Wchodzi w pełny immersive mode.
-     * Na goglach VR: ukrywa WSZYSTKIE paski systemowe i rozciąga okno.
-     */
-    @Suppress("DEPRECATION")
-    private fun enterFullscreen() {
-        isFullscreen = true
-
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-
-        // VR: dodatkowe flagi immersive (dla starszych API i gogli)
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            or View.SYSTEM_UI_FLAG_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    )
-        }
-
-        btnFullscreen.text = getString(R.string.window_mode)
-    }
-
-    private fun toggleFullscreen() {
-        isFullscreen = !isFullscreen
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-
-        if (isFullscreen) {
-            controller.hide(WindowInsetsCompat.Type.systemBars())
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            btnFullscreen.text = getString(R.string.window_mode)
-        } else {
-            controller.show(WindowInsetsCompat.Type.systemBars())
-            btnFullscreen.text = getString(R.string.fullscreen)
-        }
-        showControlsTemporarily()
-    }
-
-    // =========================================================================
-    // Controls visibility
-    // =========================================================================
-
-    private fun showControls() {
-        controlsPanel.visibility = View.VISIBLE
-        controlsVisible = true
-        hideHandler.removeCallbacks(hideRunnable)
-    }
-
-    private fun showControlsTemporarily() {
-        controlsPanel.visibility = View.VISIBLE
-        controlsVisible = true
-        scheduleHideControls()
-    }
-
-    private fun hideControls() {
-        controlsPanel.visibility = View.GONE
-        controlsVisible = false
-        hideHandler.removeCallbacks(hideRunnable)
-    }
-
-    private fun scheduleHideControls() {
-        hideHandler.removeCallbacks(hideRunnable)
-        hideHandler.postDelayed(hideRunnable, HIDE_CONTROLS_DELAY)
-    }
-
-    // =========================================================================
-    // UI Updates (używa bezwzględnego indeksu, nie indeksu w oknie)
-    // =========================================================================
-
-    private fun updateFileCounter() {
-        val total = playlistUrls.size
-        val current = if (total > 0) getAbsoluteIndex() + 1 else 0
-        fileCounterLabel.text = getString(R.string.file_counter_format, current, total)
-    }
-
-    private fun updateTitle() {
-        val absIdx = getAbsoluteIndex()
-        if (absIdx in playlistNames.indices) {
-            titleLabel.text = playlistNames[absIdx]
-        }
-    }
-
-    // =========================================================================
-    // Back
-    // =========================================================================
-
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        // Anuluj odliczanie jeśli aktywne
-        playHandler.removeCallbacksAndMessages(null)
-
-        if (isFullscreen) {
-            toggleFullscreen()
-        } else {
-            audioPlayer?.stop()
-            super.onBackPressed()
-        }
-    }
+#!/usr/bin/env python3
+"""
+Serwer HTTP do streamowania i pobierania plików multimedialnych.
+
+Uruchomienie:
+    python server.py [KATALOG] [PORT] [OPCJE]
+
+Przykłady:
+    python server.py                          # bieżący katalog, port 8080
+    python server.py D:\\Filmy                 # katalog D:\\Filmy, port 8080
+    python server.py D:\\Filmy 9090            # katalog D:\\Filmy, port 9090
+    python server.py D:\\Filmy 8080 --download # tryb chunkowany (domyślnie 500MB na żądanie)
+    python server.py D:\\Filmy 8080 --down1gb  # tryb chunkowany (min. 1GB na żądanie)
+    python server.py D:\\Filmy 8080 --down     # ciągłe ładowanie całego pliku (jak pobieranie)
+
+Opcje:
+    --download  Tryb chunkowany: serwer wysyła fragmenty (domyślnie min. 500MB na żądanie).
+                Klient musi requestować kolejne fragmenty przy przewijaniu / gdy bufor spadnie.
+    --down1gb   Jak --download, ale zawsze min. 1GB na żądanie (na start też 1GB),
+                żeby utrzymywać ~1GB "do przodu".
+    --down      Ciągłe ładowanie: serwer wysyła cały plik od razu. Wideo ładuje się cały czas
+                (gra, pauza, stop) aż do końca - bez dzielenia na 100MB.
+
+Endpointy:
+    GET /                       → przeglądarka plików (HTML) - pobieranie z przeglądarki
+    GET /api/files              → lista plików w katalogu głównym (JSON)
+    GET /api/files?path=subdir  → lista plików w podkatalogu (JSON)
+    GET /media/<ścieżka>        → streaming pliku z obsługą Range (przewijanie)
+    GET /download/<ścieżka>     → pobieranie pliku (Content-Disposition: attachment)
+
+Otwórz http://IP:PORT w przeglądarce na dowolnym urządzeniu, żeby przeglądać
+i pobierać pliki bez instalowania aplikacji.
+"""
+
+import http.server
+import json
+import os
+import sys
+import time
+import urllib.parse
+import mimetypes
+import socket
+
+# Windows (często cp1250/cp1252): nie wywalaj się na znaki spoza strony kodowej.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# ============================================================================
+# Konfiguracja
+# ============================================================================
+
+# Tryb progresywnego pobierania (--download/--down1gb): max bajtów na jedno żądanie
+# Klient pobiera fragment, odtwarza i gdy bufor spadnie - requestuje kolejny fragment.
+PROGRESSIVE_CHUNK_SIZE_DEFAULT = 500 * 1024 * 1024  # 500 MB
+PROGRESSIVE_CHUNK_SIZE_1GB = 1024 * 1024 * 1024     # 1 GB
+
+# Rozmiar porcji wysyłanych do klienta (większy = mniej syscalli = szybszy transfer)
+# 4 MB - dobry kompromis: znacznie mniej syscalli niż 1 MB, a wciąż mała latencja
+# pierwszego bajtu przy seekach (Range requests).
+SEND_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
+
+MEDIA_EXTENSIONS = {
+    '.mp3', '.mp4', '.avi', '.mkv', '.flv', '.wmv',
+    '.mov', '.m4v', '.flac', '.wav', '.ogg', '.aac',
+    '.wma', '.m4a', '.webm', '.3gp', '.ts', '.m2ts',
+    '.m3u8', '.jpg', '.jpeg', '.png', '.gif', '.bmp',
+    '.webp', '.srt', '.sub', '.ass', '.txt', '.nfo'
 }
+
+
+class StreamingHandler(http.server.BaseHTTPRequestHandler):
+    """Handler HTTP z obsługą API plików i streamingu z Range."""
+
+    root_dir = '.'
+    progressive_download = False  # tryb --download: limit 100MB na żądanie
+    continuous_download = False   # tryb --down: ciągłe ładowanie + logi prędkości
+    progressive_chunk_size = PROGRESSIVE_CHUNK_SIZE_DEFAULT  # --download/--down1gb
+
+    # Wyłącza algorytm Nagle'a - bez tego TCP może buforować małe pakiety
+    # przed wysłaniem, co na Wi-Fi dodaje losowe opóźnienia rzędu dziesiątek-
+    # -setek ms. Przy streamingu wideo to się czuje jako mikro-zacięcia.
+    disable_nagle_algorithm = True
+
+    def log_message(self, format, *args):
+        """Logowanie z lepszym formatem."""
+        print(f"[{self.log_date_time_string()}] {args[0]}")
+
+    def _send_file_with_progress(self, file_path, start, content_length, full_path):
+        """Wysyła fragment pliku.
+
+        WAŻNE: logowanie progresu NIE odbywa się już w tej samej pętli co wfile.write().
+        print()/flush() do konsoli Windows jest zaskakująco wolny i blokujący - wywoływany
+        co sekundę w środku pętli wysyłki potrafił wprowadzać mikro-zacięcia w streamie
+        wideo (objaw: "ścina losowo w trakcie odtwarzania" niezależnie od prędkości sieci).
+        Teraz log drukowany jest tylko na starcie i na końcu transferu, więc gorąca pętla
+        robi wyłącznie read() + write() - żadnego I/O na konsolę pomiędzy.
+        """
+        file_name = os.path.basename(file_path)
+        total_file_size = os.path.getsize(full_path)
+        total_file_mb = total_file_size / (1024 * 1024)
+        bytes_sent = 0
+        start_time = time.time()
+
+        with open(full_path, 'rb') as f:
+            f.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk_size = min(SEND_CHUNK_SIZE, remaining)
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                bytes_sent += len(chunk)
+                remaining -= len(chunk)
+
+        # Logowanie PO zakończeniu transferu - zero wpływu na streaming w trakcie.
+        elapsed = time.time() - start_time
+        if elapsed > 0 and bytes_sent > 0:
+            speed_avg = bytes_sent / elapsed / (1024 * 1024)
+            sent_mb = bytes_sent / (1024 * 1024)
+            print(f"  ✅ {file_name}: {sent_mb:.1f}/{total_file_mb:.1f} MB w {elapsed:.1f}s "
+                  f"(śr. {speed_avg:.1f} MB/s)")
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = urllib.parse.unquote(parsed.path)
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if path == '/api/files':
+            self.handle_file_list(query)
+        elif path.startswith('/media/'):
+            self.handle_media_stream(path[7:])
+        elif path.startswith('/download/'):
+            self.handle_download(path[10:])
+        elif path == '/' or path.startswith('/browse'):
+            self.handle_browser(query)
+        else:
+            self.send_error(404, 'Nie znaleziono')
+
+    # ========================================================================
+    # /api/files - lista plików
+    # ========================================================================
+
+    def handle_file_list(self, query):
+        """Zwraca listę plików/katalogów jako JSON."""
+        sub_path = query.get('path', [''])[0]
+        full_path = os.path.normpath(os.path.join(self.root_dir, sub_path))
+
+        # Bezpieczeństwo: nie wychodź poza root
+        if not os.path.abspath(full_path).startswith(os.path.abspath(self.root_dir)):
+            self.send_error(403, 'Zabroniony dostęp')
+            return
+
+        if not os.path.isdir(full_path):
+            self.send_error(404, 'Katalog nie istnieje')
+            return
+
+        items = []
+        try:
+            for entry in sorted(os.listdir(full_path), key=str.lower):
+                entry_path = os.path.join(full_path, entry)
+
+                # Pomiń pliki ukryte
+                if entry.startswith('.'):
+                    continue
+
+                if os.path.isdir(entry_path):
+                    items.append({
+                        'name': entry,
+                        'is_dir': True,
+                        'size': 0
+                    })
+                else:
+                    items.append({
+                        'name': entry,
+                        'is_dir': False,
+                        'size': os.path.getsize(entry_path)
+                    })
+        except PermissionError:
+            self.send_error(403, 'Brak uprawnień')
+            return
+
+        response = json.dumps(items, ensure_ascii=False)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(response.encode('utf-8'))))
+        self.end_headers()
+        self.wfile.write(response.encode('utf-8'))
+
+    # ========================================================================
+    # /media/<path> - streaming pliku z Range
+    # ========================================================================
+
+    def handle_media_stream(self, file_path):
+        """Serwuje plik z obsługą HTTP Range (przewijanie w odtwarzaczu)."""
+        full_path = os.path.normpath(os.path.join(self.root_dir, file_path))
+
+        # Bezpieczeństwo
+        if not os.path.abspath(full_path).startswith(os.path.abspath(self.root_dir)):
+            self.send_error(403, 'Zabroniony dostęp')
+            return
+
+        if not os.path.isfile(full_path):
+            self.send_error(404, 'Plik nie istnieje')
+            return
+
+        file_size = os.path.getsize(full_path)
+        content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
+
+        # Obsługa Range header (przewijanie)
+        range_header = self.headers.get('Range')
+
+        if range_header:
+            # Parsuj Range: bytes=START-END
+            try:
+                range_str = range_header.replace('bytes=', '')
+                parts = range_str.split('-')
+                start = int(parts[0]) if parts[0] else 0
+                end = int(parts[1]) if parts[1] else file_size - 1
+            except (ValueError, IndexError):
+                start = 0
+                end = file_size - 1
+
+            # Ogranicz
+            end = min(end, file_size - 1)
+
+            # Tryb --download/--down1gb: wymuś minimum danych "do przodu" w każdej odpowiedzi
+            # (jeśli klient poprosi o mniej, i tak dostanie co najmniej `progressive_chunk_size`).
+            if self.progressive_download:
+                min_end = start + self.progressive_chunk_size - 1
+                end = max(end, min_end)
+                end = min(end, file_size - 1)
+            content_length = end - start + 1
+
+            self.send_response(206)  # Partial Content
+            self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+            self.send_header('Content-Length', str(content_length))
+            self.send_header('Content-Type', content_type)
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            # Wyślij fragment pliku
+            self._send_file_with_progress(file_path, start, content_length, full_path)
+        else:
+            # Pełny plik (bez Range) - w trybie --download/--down1gb wysyłamy tylko pierwszy fragment
+            if self.progressive_download:
+                start, end = 0, min(file_size - 1, self.progressive_chunk_size - 1)
+                content_length = end - start + 1
+                self.send_response(206)  # Partial Content
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Content-Length', str(content_length))
+                self.send_header('Content-Type', content_type)
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self._send_file_with_progress(file_path, start, content_length, full_path)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self._send_file_with_progress(file_path, 0, file_size, full_path)
+
+    # ========================================================================
+    # /download/<path> - pobieranie pliku (attachment)
+    # ========================================================================
+
+    def handle_download(self, file_path):
+        """Serwuje plik z nagłówkiem Content-Disposition: attachment (pobieranie)."""
+        full_path = os.path.normpath(os.path.join(self.root_dir, file_path))
+
+        if not os.path.abspath(full_path).startswith(os.path.abspath(self.root_dir)):
+            self.send_error(403, 'Zabroniony dostęp')
+            return
+
+        if not os.path.isfile(full_path):
+            self.send_error(404, 'Plik nie istnieje')
+            return
+
+        file_size = os.path.getsize(full_path)
+        file_name = os.path.basename(full_path)
+        content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
+
+        # Content-Disposition: attachment wymusza pobieranie w przeglądarce
+        encoded_name = urllib.parse.quote(file_name)
+
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(file_size))
+        self.send_header('Content-Disposition',
+                         f'attachment; filename="{file_name}"; filename*=UTF-8\'\'{encoded_name}')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        print(f"  📥 Pobieranie: {file_name} ({file_size / (1024*1024):.1f} MB)")
+        self._send_file_with_progress(file_path, 0, file_size, full_path)
+
+    # ========================================================================
+    # / - przeglądarka plików (HTML)
+    # ========================================================================
+
+    def handle_browser(self, query):
+        """Strona z przeglądarką plików - do pobierania z dowolnej przeglądarki."""
+        sub_path = query.get('path', [''])[0]
+        full_path = os.path.normpath(os.path.join(self.root_dir, sub_path))
+
+        if not os.path.abspath(full_path).startswith(os.path.abspath(self.root_dir)):
+            self.send_error(403, 'Zabroniony dostęp')
+            return
+
+        if not os.path.isdir(full_path):
+            self.send_error(404, 'Katalog nie istnieje')
+            return
+
+        items = []
+        try:
+            for entry in sorted(os.listdir(full_path), key=str.lower):
+                if entry.startswith('.'):
+                    continue
+                entry_path = os.path.join(full_path, entry)
+                is_dir = os.path.isdir(entry_path)
+                size = 0 if is_dir else os.path.getsize(entry_path)
+                items.append((entry, is_dir, size))
+        except PermissionError:
+            self.send_error(403, 'Brak uprawnień')
+            return
+
+        # Buduj breadcrumb
+        breadcrumb_html = '<a href="/">🏠 Root</a>'
+        if sub_path:
+            parts = sub_path.split('/')
+            for i, part in enumerate(parts):
+                link_path = '/'.join(parts[:i+1])
+                breadcrumb_html += f' / <a href="/?path={urllib.parse.quote(link_path)}">{part}</a>'
+
+        # Buduj listę plików
+        rows_html = ''
+        for name, is_dir, size in items:
+            rel_path = f'{sub_path}/{name}' if sub_path else name
+
+            if is_dir:
+                link = f'/?path={urllib.parse.quote(rel_path)}'
+                icon = '📁'
+                size_str = ''
+                download_btn = ''
+            else:
+                icon = self._file_icon(name)
+                size_str = self._format_size(size)
+                dl_url = f'/download/{urllib.parse.quote(rel_path)}'
+                download_btn = f'<a href="{dl_url}" class="btn-dl">Pobierz</a>'
+                link = ''
+
+            if is_dir:
+                name_cell = f'<a href="{link}" class="dir-link">{icon} {name}</a>'
+            else:
+                name_cell = f'<span class="file-name">{icon} {name}</span>'
+
+            rows_html += f'''<tr>
+                <td class="name-col">{name_cell}</td>
+                <td class="size-col">{size_str}</td>
+                <td class="action-col">{download_btn}</td>
+            </tr>\n'''
+
+        # Przycisk "W górę"
+        back_btn = ''
+        if sub_path:
+            parent = '/'.join(sub_path.split('/')[:-1])
+            parent_url = f'/?path={urllib.parse.quote(parent)}' if parent else '/'
+            back_btn = f'<a href="{parent_url}" class="btn-back">⬆ W górę</a>'
+
+        file_count = sum(1 for _, d, _ in items if not d)
+        dir_count = sum(1 for _, d, _ in items if d)
+
+        html = f'''<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pobieranie plików</title>
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           background: #121212; color: #e0e0e0; }}
+    .header {{ background: #1a1a2e; padding: 20px; border-bottom: 2px solid #4a90d9; }}
+    .header h1 {{ color: #4a90d9; font-size: 1.4em; margin-bottom: 8px; }}
+    .breadcrumb {{ color: #aaa; font-size: 0.9em; }}
+    .breadcrumb a {{ color: #6db3f2; text-decoration: none; }}
+    .breadcrumb a:hover {{ text-decoration: underline; }}
+    .toolbar {{ padding: 12px 20px; background: #1e1e2e; display: flex;
+                align-items: center; gap: 16px; flex-wrap: wrap; }}
+    .toolbar .stats {{ color: #888; font-size: 0.85em; }}
+    .btn-back {{ display: inline-block; padding: 6px 14px; background: #333;
+                 color: #ccc; text-decoration: none; border-radius: 6px; font-size: 0.9em; }}
+    .btn-back:hover {{ background: #444; }}
+    .file-list {{ width: 100%; border-collapse: collapse; }}
+    .file-list tr {{ border-bottom: 1px solid #2a2a2a; }}
+    .file-list tr:hover {{ background: #1e1e2e; }}
+    .file-list td {{ padding: 12px 16px; vertical-align: middle; }}
+    .name-col {{ word-break: break-word; }}
+    .size-col {{ white-space: nowrap; color: #888; font-size: 0.85em; text-align: right;
+                 min-width: 80px; }}
+    .action-col {{ text-align: right; min-width: 90px; }}
+    .dir-link {{ color: #6db3f2; text-decoration: none; font-weight: 500; }}
+    .dir-link:hover {{ text-decoration: underline; }}
+    .file-name {{ color: #ccc; }}
+    .btn-dl {{ display: inline-block; padding: 6px 16px; background: #2d6a4f;
+               color: #fff; text-decoration: none; border-radius: 6px; font-size: 0.85em;
+               font-weight: 500; transition: background 0.2s; }}
+    .btn-dl:hover {{ background: #40916c; }}
+    .empty {{ padding: 40px; text-align: center; color: #666; }}
+    @media (max-width: 600px) {{
+        .file-list td {{ padding: 10px 8px; }}
+        .size-col {{ display: none; }}
+        .header {{ padding: 14px; }}
+        .header h1 {{ font-size: 1.2em; }}
+    }}
+</style>
+</head>
+<body>
+    <div class="header">
+        <h1>📥 Pobieranie plików</h1>
+        <div class="breadcrumb">{breadcrumb_html}</div>
+    </div>
+    <div class="toolbar">
+        {back_btn}
+        <span class="stats">{dir_count} katalogów, {file_count} plików</span>
+    </div>
+    <table class="file-list">
+        {rows_html if rows_html else '<tr><td colspan="3" class="empty">Katalog jest pusty</td></tr>'}
+    </table>
+</body>
+</html>'''
+
+        data = html.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    @staticmethod
+    def _file_icon(name):
+        ext = os.path.splitext(name)[1].lower()
+        if ext in ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ts', '.m2ts'):
+            return '🎬'
+        if ext in ('.mp3', '.flac', '.wav', '.ogg', '.aac', '.wma', '.m4a'):
+            return '🎵'
+        if ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'):
+            return '🖼️'
+        if ext in ('.srt', '.sub', '.ass'):
+            return '💬'
+        if ext in ('.txt', '.nfo'):
+            return '📄'
+        return '📎'
+
+    @staticmethod
+    def _format_size(size_bytes):
+        if size_bytes < 1024:
+            return f'{size_bytes} B'
+        if size_bytes < 1024 * 1024:
+            return f'{size_bytes / 1024:.0f} KB'
+        if size_bytes < 1024 * 1024 * 1024:
+            return f'{size_bytes / (1024*1024):.1f} MB'
+        return f'{size_bytes / (1024*1024*1024):.2f} GB'
+
+
+class LimitedThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer z limitem wątków naraz.
+
+    ExoPlayer (i VR z prefetchem playlisty) może otwierać kilka połączeń
+    równolegle - np. główny stream + prefetch następnego pliku + audio
+    w tle. Bez limitu, przy dużej playliście, liczba wątków rywalizujących
+    o GIL i dysk może rosnąć w sposób, który losowo "ścina" aktywny strumień.
+    Limit kolejki (request_queue_size) + krótszy timeout ogranicza to zjawisko.
+    """
+    daemon_threads = True
+    request_queue_size = 16
+
+
+def get_local_ip():
+    """Próbuje ustalić lokalne IP komputera w sieci LAN."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+def main():
+    # Argumenty
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    flags = [a for a in sys.argv[1:] if a.startswith('--')]
+
+    root_dir = args[0] if len(args) > 0 else '.'
+    port = int(args[1]) if len(args) > 1 else 8080
+    # --download = chunkowany (domyślnie 500MB na żądanie, progresywne)
+    # --down     = ciągłe ładowanie całego pliku + logi prędkości
+    # --down1gb  = chunkowany jak --download, ale zawsze min. 1GB na żądanie (start też 1GB)
+    use_progressive = '--download' in flags
+    use_continuous = '--down' in flags
+    use_progressive_1gb = '--down1gb' in flags
+
+    if use_progressive_1gb:
+        use_progressive = True
+
+    # Sprawdź katalog
+    if not os.path.isdir(root_dir):
+        print(f"❌ Katalog nie istnieje: {root_dir}")
+        sys.exit(1)
+
+    # Ustaw katalog i tryb dla handlera
+    StreamingHandler.root_dir = os.path.abspath(root_dir)
+    StreamingHandler.progressive_download = use_progressive
+    StreamingHandler.continuous_download = use_continuous
+    StreamingHandler.progressive_chunk_size = (
+        PROGRESSIVE_CHUNK_SIZE_1GB if use_progressive_1gb else PROGRESSIVE_CHUNK_SIZE_DEFAULT
+    )
+
+    # Uruchom serwer
+    local_ip = get_local_ip()
+    server = LimitedThreadingHTTPServer(('0.0.0.0', port), StreamingHandler)
+
+    print("=" * 60)
+    print("🎬 File Streaming Server")
+    print("=" * 60)
+    print(f"📁 Katalog:  {os.path.abspath(root_dir)}")
+    if use_progressive:
+        mb = StreamingHandler.progressive_chunk_size // (1024 * 1024)
+        print(f"📥 Tryb:     Chunkowany (min {mb}MB na żądanie)")
+    elif use_continuous:
+        print(f"📥 Tryb:     Ciągłe ładowanie (cały plik + prędkość pobierania)")
+    print(f"🌐 Adres:    http://{local_ip}:{port}")
+    print(f"💻 Lokalnie: http://localhost:{port}")
+    print()
+    print("📱 Pobieranie plików z przeglądarki:")
+    print(f"   Otwórz http://{local_ip}:{port} w przeglądarce na dowolnym urządzeniu")
+    print()
+    print("📺 Streaming z aplikacją File Streaming Player:")
+    print(f"   Wpisz http://{local_ip}:{port} w aplikacji na telefonie")
+    print()
+    print("Aby zakończyć, naciśnij Ctrl+C")
+    print("=" * 60)
+
+    # Policz pliki multimedialne
+    media_count = 0
+    for root, dirs, files in os.walk(root_dir):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in MEDIA_EXTENSIONS:
+                media_count += 1
+
+    print(f"📊 Znaleziono plików multimedialnych: {media_count}")
+    print()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Serwer zatrzymany.")
+        server.server_close()
+
+
+if __name__ == '__main__':
+    main()
