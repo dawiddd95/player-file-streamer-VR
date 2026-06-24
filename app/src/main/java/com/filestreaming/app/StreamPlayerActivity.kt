@@ -405,6 +405,10 @@ class StreamPlayerActivity : AppCompatActivity() {
         player.repeatMode = Player.REPEAT_MODE_OFF
         // NIE wywołujemy player.play() — czekamy na kliknięcie Play
 
+        // Jeśli muzyka w tle została wybrana wcześniej w MainActivity
+        // (opcja "Załaduj z JSON") — zainicjalizuj ją automatycznie
+        setupBackgroundAudioFromPlaylistHolder()
+
         updateFileCounter()
         updateTitle()
         statusLabel.text = getString(R.string.ready)
@@ -552,7 +556,12 @@ class StreamPlayerActivity : AppCompatActivity() {
     // Background Audio — wybór muzyki z urządzenia
     // =========================================================================
 
-    private fun onAudioPicked(uri: Uri) {
+    /**
+     * @param startPositionMsOverride jeśli podane, użyj tej pozycji startu zamiast
+     * odczytywać ją z pól minuty/sekundy (używane przy automatycznym ładowaniu
+     * muzyki w tle ustawionej wcześniej w MainActivity, opcja "Załaduj z JSON").
+     */
+    private fun onAudioPicked(uri: Uri, startPositionMsOverride: Long? = null) {
         // Zachowaj uprawnienia do odczytu
         try {
             contentResolver.takePersistableUriPermission(
@@ -572,7 +581,7 @@ class StreamPlayerActivity : AppCompatActivity() {
         val mediaItem = MediaItem.fromUri(uri)
         ap.setMediaItem(mediaItem)
 
-        val startPositionMs = getAudioStartPositionMs()
+        val startPositionMs = startPositionMsOverride ?: getAudioStartPositionMs()
         if (startPositionMs > 0) {
             ap.seekTo(startPositionMs)
         }
@@ -589,6 +598,28 @@ class StreamPlayerActivity : AppCompatActivity() {
         // Jeśli wideo jest odtwarzane, uruchom audio natychmiast
         if (player.isPlaying) {
             ap.play()
+        }
+    }
+
+    /**
+     * Odczytuje muzykę w tle ustawioną wcześniej w MainActivity (opcja
+     * "Załaduj z JSON") i automatycznie inicjalizuje odtwarzacz audio,
+     * bez konieczności ponownego wybierania pliku w tym ekranie.
+     * Uzupełnia też pola minuty/sekundy, żeby UI odzwierciedlało ustawiony czas.
+     */
+    private fun setupBackgroundAudioFromPlaylistHolder() {
+        val uriString = PlaylistHolder.backgroundAudioUri ?: return
+        val startMs = PlaylistHolder.backgroundAudioStartMs
+
+        val totalSeconds = startMs / 1000L
+        audioStartMinutesInput.setText((totalSeconds / 60).toString())
+        audioStartSecondsInput.setText((totalSeconds % 60).toString())
+
+        try {
+            onAudioPicked(Uri.parse(uriString), startPositionMsOverride = startMs)
+        } catch (_: Exception) {
+            // URI mogło stracić uprawnienia (np. po restarcie aplikacji) — po cichu pomiń,
+            // użytkownik może wybrać muzykę ręcznie przyciskiem w tym ekranie
         }
     }
 
