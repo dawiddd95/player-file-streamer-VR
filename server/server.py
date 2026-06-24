@@ -12,6 +12,7 @@ Przykłady:
     python server.py D:\\Filmy 8080 --download # tryb chunkowany (domyślnie 500MB na żądanie)
     python server.py D:\\Filmy 8080 --down1gb  # tryb chunkowany (min. 1GB na żądanie)
     python server.py D:\\Filmy 8080 --down     # ciągłe ładowanie całego pliku (jak pobieranie)
+    python server.py D:\\Filmy 8080 --playlist=lista.json  # kolejność plików z JSON-a
 
 Opcje:
     --download  Tryb chunkowany: serwer wysyła fragmenty (domyślnie min. 500MB na żądanie).
@@ -19,10 +20,15 @@ Opcje:
     --down1gb   Jak --download, ale zawsze min. 1GB na żądanie (na start też 1GB),
                 żeby utrzymywać ~1GB "do przodu".
     --down      Ciągłe ładowanie: serwer wysyła cały plik od razu. Wideo ładuje się cały czas
-                (gra, pauza, stop) aż do końca - bez dzielenia na 100MB.
+                (gra, pauza, stop) aż do końca — bez dzielenia na 100MB.
+    --playlist=plik.json
+                Wczytuje kolejność plików z pliku JSON (pole "files" — lista ścieżek,
+                z których brana jest tylko nazwa pliku). /api/files zwraca pliki
+                w katalogu głównym w tej kolejności. Pliki spoza listy i pliki
+                w podkatalogach są dosortowywane na końcu, alfabetycznie.
 
 Endpointy:
-    GET /                       → przeglądarka plików (HTML) - pobieranie z przeglądarki
+    GET /                       → przeglądarka plików (HTML) — pobieranie z przeglądarki
     GET /api/files              → lista plików w katalogu głównym (JSON)
     GET /api/files?path=subdir  → lista plików w podkatalogu (JSON)
     GET /media/<ścieżka>        → streaming pliku z obsługą Range (przewijanie)
@@ -55,14 +61,15 @@ except Exception:
 # ============================================================================
 
 # Tryb progresywnego pobierania (--download/--down1gb): max bajtów na jedno żądanie
-# Klient pobiera fragment, odtwarza i gdy bufor spadnie - requestuje kolejny fragment.
+# Klient pobiera fragment, odtwarza i gdy bufor spadnie — requestuje kolejny fragment.
 PROGRESSIVE_CHUNK_SIZE_DEFAULT = 500 * 1024 * 1024  # 500 MB
 PROGRESSIVE_CHUNK_SIZE_1GB = 1024 * 1024 * 1024     # 1 GB
 
+# Co ile MB aktualizować wyświetlanie postępu pobierania
+PROGRESS_UPDATE_MB = 5
+
 # Rozmiar porcji wysyłanych do klienta (większy = mniej syscalli = szybszy transfer)
-# 4 MB - dobry kompromis: znacznie mniej syscalli niż 1 MB, a wciąż mała latencja
-# pierwszego bajtu przy seekach (Range requests).
-SEND_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
+SEND_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 MEDIA_EXTENSIONS = {
     '.mp3', '.mp4', '.avi', '.mkv', '.flv', '.wmv',
@@ -73,6 +80,33 @@ MEDIA_EXTENSIONS = {
 }
 
 
+def load_playlist_order(playlist_path):
+    """Wczytuje kolejność plików z pliku JSON (pole "files").
+
+    Z każdej ścieżki w "files" brana jest tylko nazwa pliku (basename),
+    żeby uniknąć problemów z separatorami ścieżek Windows ("\\") vs
+    ścieżkami na serwerze. Zwraca słownik {nazwa_pliku_lowercase: indeks}.
+    """
+    try:
+        with open(playlist_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"⚠️  Nie udało się wczytać playlisty '{playlist_path}': {e}")
+        return {}
+
+    files = data.get('files', [])
+    order = {}
+    for i, entry in enumerate(files):
+        # Wyciągnij samą nazwę pliku, niezależnie od separatora ("/" lub "\")
+        name = entry.replace('\\', '/').rsplit('/', 1)[-1]
+        # Pierwsza pozycja w pliku wygrywa przy duplikatach nazw
+        if name.lower() not in order:
+            order[name.lower()] = i
+
+    print(f"📋 Playlista wczytana: {len(order)} plików z '{playlist_path}'")
+    return order
+
+
 class StreamingHandler(http.server.BaseHTTPRequestHandler):
     """Handler HTTP z obsługą API plików i streamingu z Range."""
 
@@ -80,31 +114,25 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
     progressive_download = False  # tryb --download: limit 100MB na żądanie
     continuous_download = False   # tryb --down: ciągłe ładowanie + logi prędkości
     progressive_chunk_size = PROGRESSIVE_CHUNK_SIZE_DEFAULT  # --download/--down1gb
-
-    # Wyłącza algorytm Nagle'a - bez tego TCP może buforować małe pakiety
-    # przed wysłaniem, co na Wi-Fi dodaje losowe opóźnienia rzędu dziesiątek-
-    # -setek ms. Przy streamingu wideo to się czuje jako mikro-zacięcia.
-    disable_nagle_algorithm = True
+    playlist_order = {}  # --playlist=plik.json: {nazwa_pliku_lowercase: indeks}
 
     def log_message(self, format, *args):
         """Logowanie z lepszym formatem."""
         print(f"[{self.log_date_time_string()}] {args[0]}")
 
     def _send_file_with_progress(self, file_path, start, content_length, full_path):
-        """Wysyła fragment pliku.
+        """Wysyła fragment pliku i wyświetla postęp.
 
-        WAŻNE: logowanie progresu NIE odbywa się już w tej samej pętli co wfile.write().
-        print()/flush() do konsoli Windows jest zaskakująco wolny i blokujący - wywoływany
-        co sekundę w środku pętli wysyłki potrafił wprowadzać mikro-zacięcia w streamie
-        wideo (objaw: "ścina losowo w trakcie odtwarzania" niezależnie od prędkości sieci).
-        Teraz log drukowany jest tylko na starcie i na końcu transferu, więc gorąca pętla
-        robi wyłącznie read() + write() - żadnego I/O na konsolę pomiędzy.
+        Tryb --down: nadpisuje jedną linię z prędkością (MB/s), postępem (%) i MB/MB.
+        Pozostałe tryby: drukuje co PROGRESS_UPDATE_MB.
         """
         file_name = os.path.basename(file_path)
         total_file_size = os.path.getsize(full_path)
         total_file_mb = total_file_size / (1024 * 1024)
         bytes_sent = 0
         start_time = time.time()
+        last_print_time = 0.0
+        last_printed_mb = -PROGRESS_UPDATE_MB
 
         with open(full_path, 'rb') as f:
             f.seek(start)
@@ -121,13 +149,31 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
                 bytes_sent += len(chunk)
                 remaining -= len(chunk)
 
-        # Logowanie PO zakończeniu transferu - zero wpływu na streaming w trakcie.
-        elapsed = time.time() - start_time
-        if elapsed > 0 and bytes_sent > 0:
-            speed_avg = bytes_sent / elapsed / (1024 * 1024)
-            sent_mb = bytes_sent / (1024 * 1024)
-            print(f"  ✅ {file_name}: {sent_mb:.1f}/{total_file_mb:.1f} MB w {elapsed:.1f}s "
-                  f"(śr. {speed_avg:.1f} MB/s)")
+                now = time.time()
+
+                if self.continuous_download:
+                    # --down: aktualizuj co 1s lub na końcu — jedna linia z prędkością
+                    if now - last_print_time >= 1.0 or remaining == 0:
+                        elapsed = now - start_time
+                        speed = bytes_sent / elapsed / (1024 * 1024) if elapsed > 0 else 0
+                        abs_mb = (start + bytes_sent) / (1024 * 1024)
+                        pct = (start + bytes_sent) / total_file_size * 100
+                        line = (f"  📥 {file_name}: {abs_mb:.1f} / {total_file_mb:.1f} MB "
+                                f"({pct:.0f}%) | {speed:.1f} MB/s")
+                        print(f"\r{line:<80}", end='', flush=True)
+                        last_print_time = now
+                        if remaining == 0:
+                            elapsed = now - start_time
+                            speed_avg = bytes_sent / elapsed / (1024 * 1024) if elapsed > 0 else 0
+                            print(f"\n  ✅ {file_name}: gotowe — "
+                                  f"{total_file_mb:.1f} MB w {elapsed:.1f}s "
+                                  f"(śr. {speed_avg:.1f} MB/s)")
+                else:
+                    # Domyślny/--download: drukuj co PROGRESS_UPDATE_MB
+                    sent_mb = bytes_sent / (1024 * 1024)
+                    if sent_mb - last_printed_mb >= PROGRESS_UPDATE_MB or remaining == 0:
+                        print(f"  📥 {file_name}: {sent_mb:.1f} MB / {total_file_mb:.1f} MB")
+                        last_printed_mb = sent_mb
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -146,7 +192,7 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, 'Nie znaleziono')
 
     # ========================================================================
-    # /api/files - lista plików
+    # /api/files — lista plików
     # ========================================================================
 
     def handle_file_list(self, query):
@@ -188,6 +234,25 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, 'Brak uprawnień')
             return
 
+        # Jeśli wczytano playlistę — sortuj pliki wg kolejności z JSON-a.
+        # Katalogi zawsze na górze. Pliki z playlisty w jej kolejności,
+        # pliki spoza listy dosortowane na końcu alfabetycznie.
+        if self.playlist_order:
+            order = self.playlist_order
+            unmatched_offset = len(order)
+
+            def sort_key(item):
+                if item['is_dir']:
+                    return (0, 0, item['name'].lower())
+                idx = order.get(item['name'].lower())
+                if idx is not None:
+                    return (1, idx, '')
+                return (1, unmatched_offset, item['name'].lower())
+
+            items.sort(key=sort_key)
+        else:
+            items.sort(key=lambda item: (not item['is_dir'], item['name'].lower()))
+
         response = json.dumps(items, ensure_ascii=False)
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -197,7 +262,7 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(response.encode('utf-8'))
 
     # ========================================================================
-    # /media/<path> - streaming pliku z Range
+    # /media/<path> — streaming pliku z Range
     # ========================================================================
 
     def handle_media_stream(self, file_path):
@@ -252,7 +317,7 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
             # Wyślij fragment pliku
             self._send_file_with_progress(file_path, start, content_length, full_path)
         else:
-            # Pełny plik (bez Range) - w trybie --download/--down1gb wysyłamy tylko pierwszy fragment
+            # Pełny plik (bez Range) — w trybie --download/--down1gb wysyłamy tylko pierwszy fragment
             if self.progressive_download:
                 start, end = 0, min(file_size - 1, self.progressive_chunk_size - 1)
                 content_length = end - start + 1
@@ -274,7 +339,7 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
                 self._send_file_with_progress(file_path, 0, file_size, full_path)
 
     # ========================================================================
-    # /download/<path> - pobieranie pliku (attachment)
+    # /download/<path> — pobieranie pliku (attachment)
     # ========================================================================
 
     def handle_download(self, file_path):
@@ -308,11 +373,11 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
         self._send_file_with_progress(file_path, 0, file_size, full_path)
 
     # ========================================================================
-    # / - przeglądarka plików (HTML)
+    # / — przeglądarka plików (HTML)
     # ========================================================================
 
     def handle_browser(self, query):
-        """Strona z przeglądarką plików - do pobierania z dowolnej przeglądarki."""
+        """Strona z przeglądarką plików — do pobierania z dowolnej przeglądarki."""
         sub_path = query.get('path', [''])[0]
         full_path = os.path.normpath(os.path.join(self.root_dir, sub_path))
 
@@ -476,19 +541,6 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
         return f'{size_bytes / (1024*1024*1024):.2f} GB'
 
 
-class LimitedThreadingHTTPServer(http.server.ThreadingHTTPServer):
-    """ThreadingHTTPServer z limitem wątków naraz.
-
-    ExoPlayer (i VR z prefetchem playlisty) może otwierać kilka połączeń
-    równolegle - np. główny stream + prefetch następnego pliku + audio
-    w tle. Bez limitu, przy dużej playliście, liczba wątków rywalizujących
-    o GIL i dysk może rosnąć w sposób, który losowo "ścina" aktywny strumień.
-    Limit kolejki (request_queue_size) + krótszy timeout ogranicza to zjawisko.
-    """
-    daemon_threads = True
-    request_queue_size = 16
-
-
 def get_local_ip():
     """Próbuje ustalić lokalne IP komputera w sieci LAN."""
     try:
@@ -515,6 +567,12 @@ def main():
     use_continuous = '--down' in flags
     use_progressive_1gb = '--down1gb' in flags
 
+    # --playlist=plik.json — kolejność plików z JSON-a
+    playlist_path = None
+    for flag in flags:
+        if flag.startswith('--playlist='):
+            playlist_path = flag[len('--playlist='):]
+
     if use_progressive_1gb:
         use_progressive = True
 
@@ -530,10 +588,12 @@ def main():
     StreamingHandler.progressive_chunk_size = (
         PROGRESSIVE_CHUNK_SIZE_1GB if use_progressive_1gb else PROGRESSIVE_CHUNK_SIZE_DEFAULT
     )
+    if playlist_path:
+        StreamingHandler.playlist_order = load_playlist_order(playlist_path)
 
     # Uruchom serwer
     local_ip = get_local_ip()
-    server = LimitedThreadingHTTPServer(('0.0.0.0', port), StreamingHandler)
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', port), StreamingHandler)
 
     print("=" * 60)
     print("🎬 File Streaming Server")
@@ -544,6 +604,8 @@ def main():
         print(f"📥 Tryb:     Chunkowany (min {mb}MB na żądanie)")
     elif use_continuous:
         print(f"📥 Tryb:     Ciągłe ładowanie (cały plik + prędkość pobierania)")
+    if StreamingHandler.playlist_order:
+        print(f"📋 Kolejność: wg playlisty '{playlist_path}' ({len(StreamingHandler.playlist_order)} plików)")
     print(f"🌐 Adres:    http://{local_ip}:{port}")
     print(f"💻 Lokalnie: http://localhost:{port}")
     print()
