@@ -4,10 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import android.text.InputType
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -64,6 +68,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var modeLabel: TextView
     private lateinit var btnBack: MaterialButton
     private lateinit var btnPlayAll: MaterialButton
+    private lateinit var startIndexInput: EditText
 
     private var baseUrl: String = ""
     private var currentPath: String = ""
@@ -118,6 +123,7 @@ class MainActivity : AppCompatActivity() {
         modeLabel = findViewById(R.id.modeLabel)
         btnBack = findViewById(R.id.btnBack)
         btnPlayAll = findViewById(R.id.btnPlayAll)
+        setupStartIndexInput()
 
         btnConnect.setOnClickListener { connectToServer() }
         btnBack.setOnClickListener { navigateUp() }
@@ -154,6 +160,53 @@ class MainActivity : AppCompatActivity() {
         }
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
+    }
+
+    /**
+     * Tworzy programowo pole tekstowe "zacznij od pozycji N" obok btnPlayAll,
+     * żeby można było wystartować odtwarzanie od wybranego miejsca na liście
+     * (np. od 17-go pliku), bez konieczności przewijania i klikania w niego.
+     *
+     * Tworzone w kodzie (nie w XML), żeby nie wymagać zmian w istniejącym layoucie.
+     */
+    private fun setupStartIndexInput() {
+        val parent = btnPlayAll.parent as? ViewGroup ?: return
+        val btnIndex = parent.indexOfChild(btnPlayAll)
+
+        val density = resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) }
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val label = TextView(this).apply {
+            text = "Zacznij od #:"
+            textSize = 12f
+            setPadding(0, 0, dp(8), 0)
+        }
+
+        startIndexInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "1"
+            layoutParams = LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            textSize = 12f
+        }
+
+        row.addView(label)
+        row.addView(startIndexInput)
+
+        if (parent is LinearLayout) {
+            parent.addView(row, btnIndex + 1)
+        } else {
+            parent.addView(row)
+        }
     }
 
     // =========================================================================
@@ -367,8 +420,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Odtwórz od pierwszego
-        playFile(mediaFiles[0])
+        // Odczytaj numer startowej pozycji (1-indexed dla użytkownika, np. 17 = 17. plik)
+        val typedNumber = startIndexInput.text.toString().toIntOrNull()
+        val startFrom = if (typedNumber != null && typedNumber >= 1) {
+            (typedNumber - 1).coerceAtMost(mediaFiles.size - 1)
+        } else {
+            0
+        }
+
+        playFile(mediaFiles[startFrom])
     }
 
     private fun isMediaFile(filename: String): Boolean {
@@ -389,5 +449,3 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
-
-
