@@ -6,10 +6,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -58,16 +62,10 @@ class StreamPlayerActivity : AppCompatActivity() {
         private const val PLAY_DELAY_SECONDS = 5
 
         // ---- Zarządzanie pamięcią (buffer) ----
-        // Wartości dostrojone pod Wi-Fi (sieć radiowa = jitter, nie kabel).
-        // Poprzednie MIN_BUFFER_MS=15s / BUFFER_PLAYBACK_MS=2.5s startowały
-        // odtwarzanie z bardzo małym zapasem — wystarczał chwilowy spadek
-        // przepustowości (retransmisja Wi-Fi, GC, obciążenie serwera), żeby
-        // bufor się wyczerpał szybciej niż zdążył dociągnąć dane, co dawało
-        // losowe ścinanie w trakcie odtwarzania mimo szybkiego łącza.
-        private const val MIN_BUFFER_MS = 30_000        // 30s — minimum do buforowania
-        private const val MAX_BUFFER_MS = 90_000        // 90s — max bufor w przód
-        private const val BUFFER_PLAYBACK_MS = 5_000     // 5s zapasu przed startem odtwarzania
-        private const val BUFFER_REBUFFER_MS = 8_000     // 8s zapasu po rebufferze, zanim ruszy dalej
+        private const val MIN_BUFFER_MS = 15_000        // 15s — minimum do buforowania
+        private const val MAX_BUFFER_MS = 60_000        // 60s — max bufor w przód (~30–180 MB)
+        private const val BUFFER_PLAYBACK_MS = 2_500     // 2.5s — wystarczy żeby zacząć odtwarzanie
+        private const val BUFFER_REBUFFER_MS = 5_000     // 5s — po rebufferze
         private const val BACK_BUFFER_MS = 10_000        // 10s — tył bufora, potem zwolnij RAM
 
         // ---- Sliding window (playlista) ----
@@ -93,6 +91,8 @@ class StreamPlayerActivity : AppCompatActivity() {
     private lateinit var btnLoop: MaterialButton
     private lateinit var btnRandom: MaterialButton
     private lateinit var btnSelectAudio: MaterialButton
+    private lateinit var audioStartMinutesInput: EditText
+    private lateinit var audioStartSecondsInput: EditText
 
     // --- State ---
     private var playlistUrls: Array<String> = emptyArray()
@@ -268,6 +268,7 @@ class StreamPlayerActivity : AppCompatActivity() {
         btnLoop = findViewById(R.id.btnLoop)
         btnRandom = findViewById(R.id.btnRandom)
         btnSelectAudio = findViewById(R.id.btnSelectAudio)
+        setupAudioStartTimeInputs()
 
         // VR Cinema: wideo dopasowuje się do rozmiaru okna, zachowując proporcje
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -292,15 +293,6 @@ class StreamPlayerActivity : AppCompatActivity() {
                 BUFFER_REBUFFER_MS
             )
             .setBackBuffer(BACK_BUFFER_MS, false)  // Zwolnij dane po 10s za kursorem
-            // KRYTYCZNE dla wideo VR (duża rozdzielczość = duży bitrate):
-            // Domyślny DefaultLoadControl ma też limit bufora WG ROZMIARU (bajtów),
-            // nie tylko wg czasu. Przy wysokim bitrate plik VR mógł trafiać w ten
-            // limit rozmiaru i przestawać buforować na długo PRZED osiągnięciem
-            // MAX_BUFFER_MS w czasie — co dawało wyczerpanie bufora i zacięcie,
-            // mimo że łącze (140 Mb/s) miało zapas przepustowości.
-            // prioritizeTimeOverSizeThresholds=true każe LoadControl trzymać się
-            // wyłącznie progów czasowych zdefiniowanych wyżej.
-            .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
         player = ExoPlayer.Builder(this)
@@ -483,6 +475,79 @@ class StreamPlayerActivity : AppCompatActivity() {
         return windowStart + player.currentMediaItemIndex
     }
 
+    /**
+     * Tworzy programowo dwa pola (minuty, sekundy) do ustawienia punktu startu
+     * muzyki w tle — dodawane są pod audioLabel, w tym samym kontenerze.
+     *
+     * Tworzone w kodzie (nie w XML), żeby nie wymagać zmian w istniejącym layoucie.
+     */
+    private fun setupAudioStartTimeInputs() {
+        val parent = audioLabel.parent as? ViewGroup ?: return
+        val audioLabelIndex = parent.indexOfChild(audioLabel)
+
+        val density = resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) }
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+
+        val label = TextView(this).apply {
+            text = "Start audio (min:sek):"
+            setTextColor(audioLabel.currentTextColor)
+            textSize = 12f
+            setPadding(0, 0, dp(8), 0)
+        }
+
+        audioStartMinutesInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "min"
+            layoutParams = LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            textSize = 12f
+        }
+
+        val separator = TextView(this).apply {
+            text = ":"
+            setTextColor(audioLabel.currentTextColor)
+            setPadding(dp(4), 0, dp(4), 0)
+        }
+
+        audioStartSecondsInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "sek"
+            layoutParams = LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            textSize = 12f
+        }
+
+        row.addView(label)
+        row.addView(audioStartMinutesInput)
+        row.addView(separator)
+        row.addView(audioStartSecondsInput)
+
+        if (parent is LinearLayout) {
+            parent.addView(row, audioLabelIndex + 1)
+        } else {
+            parent.addView(row)
+        }
+    }
+
+    /**
+     * Odczytuje punkt startu (ms) z pól minuty/sekundy. Wartości puste lub
+     * niepoprawne traktowane są jako 0.
+     */
+    private fun getAudioStartPositionMs(): Long {
+        val minutes = audioStartMinutesInput.text.toString().toLongOrNull() ?: 0L
+        val seconds = audioStartSecondsInput.text.toString().toLongOrNull() ?: 0L
+        return (minutes * 60 + seconds) * 1000L
+    }
+
     // =========================================================================
     // Background Audio — wybór muzyki z urządzenia
     // =========================================================================
@@ -506,6 +571,12 @@ class StreamPlayerActivity : AppCompatActivity() {
 
         val mediaItem = MediaItem.fromUri(uri)
         ap.setMediaItem(mediaItem)
+
+        val startPositionMs = getAudioStartPositionMs()
+        if (startPositionMs > 0) {
+            ap.seekTo(startPositionMs)
+        }
+
         ap.prepare()
 
         audioPlayer = ap
